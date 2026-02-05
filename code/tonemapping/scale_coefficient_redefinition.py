@@ -111,6 +111,18 @@ def compute_image_features(linear_16, hist_bins=16):
     )
 
 
+def compute_full_features(linear_16, seg_map, num_classes, hist_bins=16, exposure_ev=None):
+    image_feat = compute_image_features(linear_16, hist_bins=hist_bins)
+    seg_dist = compute_seg_distribution(seg_map, num_classes)
+    if exposure_ev is not None:
+        image_feat = np.concatenate(
+            [image_feat, seg_dist, np.array([float(exposure_ev)], dtype=np.float32)], axis=0
+        )
+    else:
+        image_feat = np.concatenate([image_feat, seg_dist], axis=0)
+    return image_feat
+
+
 def image_feature_names(hist_bins=16):
     names = [
         "luma_mean",

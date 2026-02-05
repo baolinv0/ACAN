@@ -14,6 +14,7 @@ try:
         ScaleCoefficientRedefiner,
         build_feature_names,
         compute_image_features,
+        compute_full_features,
         compute_seg_distribution,
         extract_scale_coeffs,
         fisher_score,
@@ -26,6 +27,7 @@ except ImportError:
         ScaleCoefficientRedefiner,
         build_feature_names,
         compute_image_features,
+        compute_full_features,
         compute_seg_distribution,
         extract_scale_coeffs,
         fisher_score,
@@ -33,6 +35,11 @@ except ImportError:
         normalize_adjustments,
         standardize_features,
     )
+
+try:
+    from .person_adjustment_predictor import save_predictor, train_predictor
+except ImportError:
+    from person_adjustment_predictor import save_predictor, train_predictor
 
 
 def _read_image(path, keep_channels=False):
@@ -121,6 +128,17 @@ def main():
     parser.add_argument("--residual-mode", choices=["delta", "ratio", "zscore"], default="delta")
     parser.add_argument("--top-k-features", type=int, default=20)
     parser.add_argument("--export-selected-features", action="store_true")
+    parser.add_argument("--train-scale-predictor", action="store_true")
+    parser.add_argument("--use-topk-features", action="store_true")
+    parser.add_argument("--target-residuals", action="store_true")
+    parser.add_argument("--predictor-epochs", type=int, default=200)
+    parser.add_argument("--predictor-lr", type=float, default=1e-3)
+    parser.add_argument("--predictor-weight-decay", type=float, default=1e-4)
+    parser.add_argument("--predictor-hidden", type=int, default=64)
+    parser.add_argument("--predictor-embed-dim", type=int, default=64)
+    parser.add_argument("--predictor-batch-size", type=int, default=256)
+    parser.add_argument("--use-type-as-scene", action="store_true")
+    parser.add_argument("--type-scene-weight", type=float, default=0.2)
     parser.add_argument("--output-dir", default="scale_redefinition")
     args = parser.parse_args()
 
@@ -188,8 +206,13 @@ def main():
     top_k = min(int(args.top_k_features), scores.shape[0]) if scores.size > 0 else 0
     top_idx = np.argsort(scores)[::-1][:top_k] if top_k > 0 else np.array([], dtype=np.int64)
     top_features = [(feature_names[i], float(scores[i])) for i in top_idx]
-    selected_features = features_std[:, top_idx] if top_idx.size > 0 else np.zeros((features_std.shape[0], 0))
-    type_acc_top, centroids_top = nearest_centroid_accuracy(selected_features, redefiner.labels)
+    selected_features_std = (
+        features_std[:, top_idx] if top_idx.size > 0 else np.zeros((features_std.shape[0], 0))
+    )
+    selected_features_raw = (
+        features[:, top_idx] if top_idx.size > 0 else np.zeros((features.shape[0], 0))
+    )
+    type_acc_top, centroids_top = nearest_centroid_accuracy(selected_features_std, redefiner.labels)
 
     summary = redefiner.summary(coeffs)
     summary.update(
@@ -223,7 +246,8 @@ def main():
         json.dump(summary, f, indent=2)
 
     if args.export_selected_features:
-        np.save(os.path.join(args.output_dir, "type_selected_features.npy"), selected_features)
+        np.save(os.path.join(args.output_dir, "type_selected_features.npy"), selected_features_raw)
+        np.save(os.path.join(args.output_dir, "type_selected_features_std.npy"), selected_features_std)
         np.save(os.path.join(args.output_dir, "type_centroids.npy"), centroids_top)
         with open(os.path.join(args.output_dir, "type_feature_info.json"), "w") as f:
             json.dump(
@@ -233,10 +257,56 @@ def main():
                     "selected_names": [name for name, _ in top_features],
                     "mean": feat_mean.reshape(-1).tolist(),
                     "std": feat_std.reshape(-1).tolist(),
+                    "num_classes": int(args.num_classes),
+                    "hist_bins": int(args.hist_bins),
+                    "include_exposure": True,
                 },
                 f,
                 indent=2,
             )
+
+    if args.train_scale_predictor:
+        if args.use_topk_features and top_idx.size > 0:
+            train_features = selected_features_raw
+        else:
+            train_features = features
+
+        if args.target_residuals:
+            train_targets = residuals
+            target_kind = "residuals"
+        else:
+            train_targets = coeffs
+            target_kind = "coeffs"
+
+        scene_labels = redefiner.labels if args.use_type_as_scene else None
+        model, standardizer = train_predictor(
+            train_features,
+            train_targets,
+            epochs=args.predictor_epochs,
+            lr=args.predictor_lr,
+            weight_decay=args.predictor_weight_decay,
+            hidden=args.predictor_hidden,
+            embed_dim=args.predictor_embed_dim,
+            batch_size=args.predictor_batch_size,
+            scene_labels=scene_labels,
+            scene_weight=args.type_scene_weight if args.use_type_as_scene else 0.0,
+            contrastive_weight=0.0,
+            device="cpu",
+        )
+
+        config = {
+            "model": "advanced",
+            "in_dim": int(train_features.shape[1]),
+            "hidden": int(args.predictor_hidden),
+            "embed_dim": int(args.predictor_embed_dim),
+            "out_dim": int(train_targets.shape[1]),
+            "selected_indices": top_idx.tolist() if args.use_topk_features else None,
+            "feature_names": feature_names,
+            "target_kind": target_kind,
+            "num_types": int(args.num_types),
+            "num_classes": int(args.num_classes),
+        }
+        save_predictor(model, standardizer, args.output_dir, config=config)
 
     mapping_path = os.path.join(args.output_dir, "redefined_coeffs.csv")
     with open(mapping_path, "w", newline="") as f:
