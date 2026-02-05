@@ -62,7 +62,7 @@ def extract_scale_coeffs(
 
 
 def compute_seg_distribution(seg_map, num_classes):
-    seg_flat = seg_map.reshape(-1)
+    seg_flat = seg_map.reshape(-1).astype(np.int64)
     counts = np.bincount(seg_flat, minlength=num_classes).astype(np.float32)
     denom = max(1.0, float(counts.sum()))
     return counts / denom
@@ -109,6 +109,73 @@ def compute_image_features(linear_16, hist_bins=16):
     return np.concatenate(
         [np.array([mean, std, p5, p50, p95, contrast], dtype=np.float32), hist], axis=0
     )
+
+
+def image_feature_names(hist_bins=16):
+    names = [
+        "luma_mean",
+        "luma_std",
+        "luma_p5",
+        "luma_p50",
+        "luma_p95",
+        "luma_contrast",
+    ]
+    names += ["luma_hist_{}".format(i) for i in range(hist_bins)]
+    return names
+
+
+def build_feature_names(num_classes, hist_bins=16, include_exposure=True):
+    names = image_feature_names(hist_bins=hist_bins)
+    names += ["seg_ratio_{}".format(i) for i in range(num_classes)]
+    if include_exposure:
+        names.append("exposure_ev")
+    return names
+
+
+def standardize_features(x):
+    x = np.asarray(x, dtype=np.float32)
+    mean = x.mean(axis=0, keepdims=True)
+    std = x.std(axis=0, keepdims=True)
+    std = np.maximum(std, 1e-6)
+    return (x - mean) / std, mean, std
+
+
+def fisher_score(features, labels):
+    features = np.asarray(features, dtype=np.float32)
+    labels = np.asarray(labels, dtype=np.int64)
+    n, d = features.shape
+    if n == 0:
+        return np.zeros((d,), dtype=np.float32)
+    classes = np.unique(labels)
+    overall_mean = features.mean(axis=0)
+    sb = np.zeros((d,), dtype=np.float32)
+    sw = np.zeros((d,), dtype=np.float32)
+    for c in classes:
+        mask = labels == c
+        if not np.any(mask):
+            continue
+        x_c = features[mask]
+        mean_c = x_c.mean(axis=0)
+        sb += float(mask.sum()) * (mean_c - overall_mean) ** 2
+        sw += ((x_c - mean_c) ** 2).sum(axis=0)
+    scores = sb / np.maximum(sw, 1e-6)
+    return scores
+
+
+def nearest_centroid_accuracy(features, labels):
+    features = np.asarray(features, dtype=np.float32)
+    labels = np.asarray(labels, dtype=np.int64)
+    if features.shape[0] == 0:
+        return 0.0, np.zeros((0, features.shape[1]), dtype=np.float32)
+    classes = np.unique(labels)
+    centroids = []
+    for c in classes:
+        centroids.append(features[labels == c].mean(axis=0))
+    centroids = np.stack(centroids, axis=0)
+    dists = ((features[:, None, :] - centroids[None, :, :]) ** 2).sum(axis=2)
+    pred = classes[dists.argmin(axis=1)]
+    acc = float((pred == labels).mean())
+    return acc, centroids
 
 
 def kmeans_numpy(x, k, iters=20, seed=0):

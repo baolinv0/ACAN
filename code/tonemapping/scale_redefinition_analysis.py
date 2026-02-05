@@ -12,18 +12,26 @@ import numpy as np
 try:
     from .scale_coefficient_redefinition import (
         ScaleCoefficientRedefiner,
+        build_feature_names,
         compute_image_features,
         compute_seg_distribution,
         extract_scale_coeffs,
+        fisher_score,
+        nearest_centroid_accuracy,
         normalize_adjustments,
+        standardize_features,
     )
 except ImportError:
     from scale_coefficient_redefinition import (
         ScaleCoefficientRedefiner,
+        build_feature_names,
         compute_image_features,
         compute_seg_distribution,
         extract_scale_coeffs,
+        fisher_score,
+        nearest_centroid_accuracy,
         normalize_adjustments,
+        standardize_features,
     )
 
 
@@ -111,6 +119,8 @@ def main():
     parser.add_argument("--num-types", type=int, default=6)
     parser.add_argument("--cluster-use-coeffs", action="store_true")
     parser.add_argument("--residual-mode", choices=["delta", "ratio", "zscore"], default="delta")
+    parser.add_argument("--top-k-features", type=int, default=20)
+    parser.add_argument("--export-selected-features", action="store_true")
     parser.add_argument("--output-dir", default="scale_redefinition")
     args = parser.parse_args()
 
@@ -166,6 +176,21 @@ def main():
     ).fit(cluster_input, coeffs)
     residuals = redefiner.transform(coeffs)
 
+    feature_names = build_feature_names(
+        num_classes=args.num_classes,
+        hist_bins=args.hist_bins,
+        include_exposure=True,
+    )
+
+    features_std, feat_mean, feat_std = standardize_features(features)
+    type_acc_full, centroids_full = nearest_centroid_accuracy(features_std, redefiner.labels)
+    scores = fisher_score(features_std, redefiner.labels)
+    top_k = min(int(args.top_k_features), scores.shape[0]) if scores.size > 0 else 0
+    top_idx = np.argsort(scores)[::-1][:top_k] if top_k > 0 else np.array([], dtype=np.int64)
+    top_features = [(feature_names[i], float(scores[i])) for i in top_idx]
+    selected_features = features_std[:, top_idx] if top_idx.size > 0 else np.zeros((features_std.shape[0], 0))
+    type_acc_top, centroids_top = nearest_centroid_accuracy(selected_features, redefiner.labels)
+
     summary = redefiner.summary(coeffs)
     summary.update(
         {
@@ -177,6 +202,9 @@ def main():
             "num_types": int(args.num_types),
             "residual_mode": args.residual_mode,
             "cluster_use_coeffs": bool(args.cluster_use_coeffs),
+            "type_classifier_accuracy_full": float(type_acc_full),
+            "type_classifier_accuracy_topk": float(type_acc_top),
+            "type_feature_topk": top_features,
         }
     )
 
@@ -193,6 +221,22 @@ def main():
         json.dump(params, f, indent=2)
     with open(os.path.join(args.output_dir, "analysis_report.json"), "w") as f:
         json.dump(summary, f, indent=2)
+
+    if args.export_selected_features:
+        np.save(os.path.join(args.output_dir, "type_selected_features.npy"), selected_features)
+        np.save(os.path.join(args.output_dir, "type_centroids.npy"), centroids_top)
+        with open(os.path.join(args.output_dir, "type_feature_info.json"), "w") as f:
+            json.dump(
+                {
+                    "feature_names": feature_names,
+                    "selected_indices": top_idx.tolist(),
+                    "selected_names": [name for name, _ in top_features],
+                    "mean": feat_mean.reshape(-1).tolist(),
+                    "std": feat_std.reshape(-1).tolist(),
+                },
+                f,
+                indent=2,
+            )
 
     mapping_path = os.path.join(args.output_dir, "redefined_coeffs.csv")
     with open(mapping_path, "w", newline="") as f:
