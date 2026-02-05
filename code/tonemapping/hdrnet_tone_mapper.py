@@ -28,6 +28,11 @@ def _safe_logit(x, eps=1e-6):
     return math.log(x / (1.0 - x))
 
 
+def _safe_atanh(x, eps=1e-6):
+    x = max(-1.0 + eps, min(1.0 - eps, float(x)))
+    return math.atanh(x)
+
+
 class HDRNetLocal(nn.Module):
     """
     Lightweight HDRNet-style bilateral grid for local tone mapping.
@@ -41,6 +46,9 @@ class HDRNetLocal(nn.Module):
         grid_height=16,
         grid_width=16,
         coeffs=12,
+        coeff_scale_range=0.5,
+        coeff_bias_range=0.25,
+        guide_bias_range=0.25,
         embedding_dim=8,
         hidden=32,
         guide_hidden=16,
@@ -53,6 +61,9 @@ class HDRNetLocal(nn.Module):
         self.grid_height = int(grid_height)
         self.grid_width = int(grid_width)
         self.coeffs = int(coeffs)
+        self.coeff_scale_range = float(coeff_scale_range)
+        self.coeff_bias_range = float(coeff_bias_range)
+        self.guide_bias_range = float(guide_bias_range)
         self.embedding_dim = int(embedding_dim)
         self.use_exposure = bool(use_exposure)
         self.eps = float(eps)
@@ -74,8 +85,12 @@ class HDRNetLocal(nn.Module):
             nn.Conv2d(in_ch, guide_hidden, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(guide_hidden, 1, kernel_size=1),
-            nn.Sigmoid(),
         )
+        self.guide_act = nn.Sigmoid()
+
+        self.raw_coeff_scale = nn.Parameter(torch.zeros(self.num_classes, self.coeffs))
+        self.raw_coeff_bias = nn.Parameter(torch.zeros(self.num_classes, self.coeffs))
+        self.raw_guide_bias = nn.Parameter(torch.zeros(self.num_classes))
 
     def _ensure_tensor(self, x, device, dtype):
         if torch.is_tensor(x):
@@ -151,6 +166,70 @@ class HDRNetLocal(nn.Module):
             features.append(ev_map)
         return torch.cat(features, dim=1)
 
+    def _coerce_class_param(self, value, device, dtype):
+        t = torch.as_tensor(value, device=device, dtype=dtype).flatten()
+        if t.numel() == 1:
+            t = t.repeat(self.num_classes)
+        if t.numel() != self.num_classes:
+            raise ValueError("Parameter must have num_classes elements")
+        return t
+
+    def _coerce_coeff_param(self, value, device, dtype):
+        t = torch.as_tensor(value, device=device, dtype=dtype)
+        if t.numel() == 1:
+            t = t.view(1, 1).repeat(self.num_classes, self.coeffs)
+        elif t.dim() == 1 and t.numel() == self.num_classes:
+            t = t.view(self.num_classes, 1).repeat(1, self.coeffs)
+        elif t.dim() == 2 and t.size(0) == self.num_classes and t.size(1) == self.coeffs:
+            pass
+        else:
+            raise ValueError("Coeff param must be scalar, [num_classes], or [num_classes, coeffs]")
+        return t
+
+    def _semantic_coeff_params(self):
+        scale = 1.0 + self.coeff_scale_range * torch.tanh(self.raw_coeff_scale)
+        bias = self.coeff_bias_range * torch.tanh(self.raw_coeff_bias)
+        return scale, bias
+
+    def _semantic_guide_bias(self):
+        return self.guide_bias_range * torch.tanh(self.raw_guide_bias)
+
+    def get_semantic_params(self):
+        scale, bias = self._semantic_coeff_params()
+        guide_bias = self._semantic_guide_bias()
+        return {
+            "coeff_scale": scale.detach().cpu().numpy(),
+            "coeff_bias": bias.detach().cpu().numpy(),
+            "guide_bias": guide_bias.detach().cpu().numpy(),
+        }
+
+    def set_semantic_params(self, coeff_scale=None, coeff_bias=None, guide_bias=None):
+        device = self.raw_coeff_scale.device
+        dtype = self.raw_coeff_scale.dtype
+        if coeff_scale is not None:
+            scale = self._coerce_coeff_param(coeff_scale, device, dtype)
+            if self.coeff_scale_range > 0:
+                scale = torch.clamp(
+                    scale, 1.0 - self.coeff_scale_range, 1.0 + self.coeff_scale_range
+                )
+                raw = (scale - 1.0) / self.coeff_scale_range
+                raw = torch.clamp(raw, -0.999, 0.999)
+                self.raw_coeff_scale.data = torch.atanh(raw)
+        if coeff_bias is not None:
+            bias = self._coerce_coeff_param(coeff_bias, device, dtype)
+            if self.coeff_bias_range > 0:
+                bias = torch.clamp(bias, -self.coeff_bias_range, self.coeff_bias_range)
+                raw = bias / self.coeff_bias_range
+                raw = torch.clamp(raw, -0.999, 0.999)
+                self.raw_coeff_bias.data = torch.atanh(raw)
+        if guide_bias is not None:
+            bias = self._coerce_class_param(guide_bias, device, dtype)
+            if self.guide_bias_range > 0:
+                bias = torch.clamp(bias, -self.guide_bias_range, self.guide_bias_range)
+                raw = bias / self.guide_bias_range
+                raw = torch.clamp(raw, -0.999, 0.999)
+                self.raw_guide_bias.data = torch.atanh(raw)
+
     def _slice_coeffs(self, coeff_grid, guide):
         b, c, d, gh, gw = coeff_grid.shape
         _, _, h, w = guide.shape
@@ -171,6 +250,25 @@ class HDRNetLocal(nn.Module):
 
         coeff = F.grid_sample(coeff_grid, grid, mode="bilinear", align_corners=True)
         return coeff.squeeze(2)
+
+    def _resolve_semantic_params(self, semantic_adjustments, device, dtype):
+        scale, bias = self._semantic_coeff_params()
+        guide_bias = self._semantic_guide_bias()
+
+        if semantic_adjustments is not None:
+            if "coeff_scale" in semantic_adjustments and semantic_adjustments["coeff_scale"] is not None:
+                scale = self._coerce_coeff_param(
+                    semantic_adjustments["coeff_scale"], device, dtype
+                )
+            if "coeff_bias" in semantic_adjustments and semantic_adjustments["coeff_bias"] is not None:
+                bias = self._coerce_coeff_param(
+                    semantic_adjustments["coeff_bias"], device, dtype
+                )
+            if "guide_bias" in semantic_adjustments and semantic_adjustments["guide_bias"] is not None:
+                guide_bias = self._coerce_class_param(
+                    semantic_adjustments["guide_bias"], device, dtype
+                )
+        return scale, bias, guide_bias
 
     def _apply_coeffs(self, inp, coeff_map):
         b, c, h, w = inp.shape
@@ -195,7 +293,14 @@ class HDRNetLocal(nn.Module):
             return out[:, 0:1]
         return out
 
-    def forward(self, linear_16, seg_map, exposure_ev=None, normalize_input=True):
+    def forward(
+        self,
+        linear_16,
+        seg_map,
+        exposure_ev=None,
+        normalize_input=True,
+        semantic_adjustments=None,
+    ):
         input_was_unbatched = linear_16.dim() == 3
 
         linear_16, seg_map = self._prepare_inputs(linear_16, seg_map)
@@ -212,7 +317,11 @@ class HDRNetLocal(nn.Module):
 
         luma = _luminance(linear_16)
         guide_in = self._build_features(luma, seg_map, exposure_ev)
-        guide = self.guide_net(guide_in)
+        guide_logits = self.guide_net(guide_in)
+        scale, bias, guide_bias = self._resolve_semantic_params(
+            semantic_adjustments, linear_16.device, linear_16.dtype
+        )
+        guide_logits = guide_logits + guide_bias[seg_map].unsqueeze(1)
 
         luma_low = F.adaptive_avg_pool2d(luma, (self.grid_height, self.grid_width))
         seg_low = F.interpolate(
@@ -227,7 +336,11 @@ class HDRNetLocal(nn.Module):
             coeff.size(0), self.coeffs, self.grid_depth, self.grid_height, self.grid_width
         )
 
-        coeff_map = self._slice_coeffs(coeff, guide)
+        guide_for_slice = self.guide_act(guide_logits)
+        coeff_map = self._slice_coeffs(coeff, guide_for_slice)
+        scale_map = scale[seg_map].permute(0, 3, 1, 2)
+        bias_map = bias[seg_map].permute(0, 3, 1, 2)
+        coeff_map = coeff_map * scale_map + bias_map
         out = self._apply_coeffs(linear_16, coeff_map)
 
         if input_was_unbatched:
@@ -286,6 +399,7 @@ class SemanticHDRNetToneMapper(nn.Module):
                 "grid_width": int(self.hdrnet.grid_width),
                 "coeffs": int(self.hdrnet.coeffs),
             },
+            "hdrnet_semantic": self.hdrnet.get_semantic_params(),
         }
 
     def set_adjustment_params(self, params):
@@ -295,6 +409,8 @@ class SemanticHDRNetToneMapper(nn.Module):
             self.base.set_adjustment_params(params["base"])
         if "mix" in params and params["mix"] is not None:
             self.set_mix_params(params["mix"])
+        if "hdrnet_semantic" in params and params["hdrnet_semantic"] is not None:
+            self.hdrnet.set_semantic_params(**params["hdrnet_semantic"])
 
     def export_lut(self, num_points=1024, device="cpu"):
         return self.base.export_lut(num_points=num_points, device=device)
@@ -312,6 +428,7 @@ class SemanticHDRNetToneMapper(nn.Module):
         normalize_input=True,
         base_adjustments=None,
         mix_adjustments=None,
+        hdrnet_adjustments=None,
         adjustments=None,
     ):
         input_was_unbatched = linear_16.dim() == 3
@@ -327,6 +444,8 @@ class SemanticHDRNetToneMapper(nn.Module):
                 base_adjustments = adjustments.get("base")
             if "mix" in adjustments:
                 mix_adjustments = adjustments.get("mix")
+            if "hdrnet_semantic" in adjustments:
+                hdrnet_adjustments = adjustments.get("hdrnet_semantic")
 
         base_out = self.base(
             linear_16,
@@ -340,6 +459,7 @@ class SemanticHDRNetToneMapper(nn.Module):
             seg_map,
             exposure_ev=exposure_ev,
             normalize_input=normalize_input,
+            semantic_adjustments=hdrnet_adjustments,
         )
 
         mix = torch.sigmoid(self.raw_mix)

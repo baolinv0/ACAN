@@ -62,6 +62,9 @@ def train(args):
             "grid_height": args.hdrnet_grid_height,
             "grid_width": args.hdrnet_grid_width,
             "coeffs": args.hdrnet_coeffs,
+            "coeff_scale_range": args.hdrnet_coeff_scale_range,
+            "coeff_bias_range": args.hdrnet_coeff_bias_range,
+            "guide_bias_range": args.hdrnet_guide_bias_range,
             "embedding_dim": args.hdrnet_embedding_dim,
             "hidden": args.hdrnet_hidden,
             "guide_hidden": args.hdrnet_guide_hidden,
@@ -184,6 +187,9 @@ def build_parser():
     parser.add_argument("--hdrnet-grid-height", type=int, default=16)
     parser.add_argument("--hdrnet-grid-width", type=int, default=16)
     parser.add_argument("--hdrnet-coeffs", type=int, default=12)
+    parser.add_argument("--hdrnet-coeff-scale-range", type=float, default=0.5)
+    parser.add_argument("--hdrnet-coeff-bias-range", type=float, default=0.25)
+    parser.add_argument("--hdrnet-guide-bias-range", type=float, default=0.25)
     parser.add_argument("--hdrnet-embedding-dim", type=int, default=8)
     parser.add_argument("--hdrnet-hidden", type=int, default=32)
     parser.add_argument("--hdrnet-guide-hidden", type=int, default=16)
