@@ -74,12 +74,65 @@ def compute_histogram(luma, bins=16, mask=None):
     return hist
 
 
+def compute_quantile_curve(values, quantiles=None, degree=2):
+    if quantiles is None:
+        quantiles = [5, 25, 50, 75, 95]
+    if values.size == 0:
+        return np.zeros((len(quantiles),), dtype=np.float32), np.zeros((degree + 1,), dtype=np.float32)
+    q_vals = np.percentile(values, quantiles).astype(np.float32)
+    q_x = np.array(quantiles, dtype=np.float32) / 100.0
+    try:
+        coeff = np.polyfit(q_x, q_vals, degree).astype(np.float32)
+    except Exception:
+        coeff = np.zeros((degree + 1,), dtype=np.float32)
+    return q_vals, coeff
+
+
+class HistogramProjector(object):
+    def __init__(self, dim=8):
+        self.dim = int(dim)
+        self.mean = None
+        self.components = None
+
+    def fit(self, x):
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim != 2 or x.shape[1] == 0:
+            raise ValueError("HistogramProjector expects 2D input with non-zero features")
+        if self.dim > x.shape[1]:
+            self.dim = x.shape[1]
+        self.mean = x.mean(axis=0, keepdims=True)
+        x0 = x - self.mean
+        u, s, vt = np.linalg.svd(x0, full_matrices=False)
+        self.components = vt[: self.dim]
+        return self
+
+    def transform(self, x):
+        x = np.asarray(x, dtype=np.float32)
+        x0 = x - self.mean
+        return np.dot(x0, self.components.T)
+
+    def to_dict(self):
+        return {"dim": self.dim, "mean": self.mean.tolist(), "components": self.components.tolist()}
+
+    @classmethod
+    def from_dict(cls, data):
+        obj = cls(dim=int(data["dim"]))
+        obj.mean = np.array(data["mean"], dtype=np.float32)
+        obj.components = np.array(data["components"], dtype=np.float32)
+        return obj
+
+
 def compute_features(
     linear_16,
     seg_map,
     exposure_ev,
     person_class,
     bins=16,
+    quantiles=None,
+    quantile_degree=2,
+    hist_projector=None,
+    include_raw_hist=True,
+    return_parts=False,
 ):
     linear = _normalize_linear(linear_16)
     luma = compute_luminance(linear)
@@ -89,6 +142,11 @@ def compute_features(
     person_stats = compute_stats(luma, person_mask)
     global_hist = compute_histogram(luma, bins=bins, mask=None)
     person_hist = compute_histogram(luma, bins=bins, mask=person_mask)
+
+    person_values = _masked_values(luma, person_mask)
+    quantile_vals, quantile_coeff = compute_quantile_curve(
+        person_values, quantiles=quantiles, degree=quantile_degree
+    )
 
     contrast_global = global_stats["p95"] - global_stats["p5"]
     contrast_person = person_stats["p95"] - person_stats["p5"]
@@ -111,11 +169,28 @@ def compute_features(
         ev,
     ]
     features = np.array(features, dtype=np.float32)
-    features = np.concatenate([features, global_hist, person_hist], axis=0)
+    hist_vec = np.concatenate([global_hist, person_hist], axis=0)
+    if hist_projector is not None:
+        hist_proj = hist_projector.transform(hist_vec[None, :])[0]
+        if include_raw_hist:
+            hist_vec = np.concatenate([hist_vec, hist_proj], axis=0)
+        else:
+            hist_vec = hist_proj
+
+    features = np.concatenate([features, quantile_vals, quantile_coeff, hist_vec], axis=0)
+    if return_parts:
+        return {
+            "features": features,
+            "hist": hist_vec,
+            "quantile_vals": quantile_vals,
+            "quantile_coeff": quantile_coeff,
+        }
     return features
 
 
-def feature_names(bins=16):
+def feature_names(bins=16, quantiles=None, quantile_degree=2, hist_proj_dim=None, include_raw_hist=True):
+    if quantiles is None:
+        quantiles = [5, 25, 50, 75, 95]
     base = [
         "global_mean",
         "global_std",
@@ -131,8 +206,15 @@ def feature_names(bins=16):
         "person_contrast",
         "exposure_ev",
     ]
-    base += ["global_hist_{}".format(i) for i in range(bins)]
-    base += ["person_hist_{}".format(i) for i in range(bins)]
+    base += ["person_q{}".format(q) for q in quantiles]
+    base += ["person_q_poly_{}".format(i) for i in range(quantile_degree + 1)]
+    hist_names = ["global_hist_{}".format(i) for i in range(bins)]
+    hist_names += ["person_hist_{}".format(i) for i in range(bins)]
+    if hist_proj_dim is not None and not include_raw_hist:
+        hist_names = ["hist_proj_{}".format(i) for i in range(hist_proj_dim)]
+    elif hist_proj_dim is not None and include_raw_hist:
+        hist_names += ["hist_proj_{}".format(i) for i in range(hist_proj_dim)]
+    base += hist_names
     return base
 
 
@@ -202,6 +284,74 @@ class Standardizer(object):
         return obj
 
 
+def augment_features(x, noise_std=0.01, dropout_prob=0.1):
+    if noise_std > 0:
+        x = x + np.random.normal(0.0, noise_std, size=x.shape).astype(np.float32)
+    if dropout_prob > 0:
+        mask = np.random.rand(*x.shape) > dropout_prob
+        x = x * mask
+    return x
+
+
+def augment_features_torch(x, noise_std=0.01, dropout_prob=0.1):
+    if noise_std > 0:
+        x = x + noise_std * torch.randn_like(x)
+    if dropout_prob > 0:
+        mask = (torch.rand_like(x) > dropout_prob).float()
+        x = x * mask
+    return x
+
+
+def nt_xent_loss(z1, z2, temperature=0.1, eps=1e-8):
+    z1 = F.normalize(z1, dim=1)
+    z2 = F.normalize(z2, dim=1)
+    batch = z1.size(0)
+    z = torch.cat([z1, z2], dim=0)
+    sim = torch.mm(z, z.t()) / max(temperature, eps)
+
+    diag = torch.eye(2 * batch, device=z.device, dtype=torch.bool)
+    sim = sim.masked_fill(diag, -1e9)
+
+    labels = torch.arange(2 * batch, device=z.device)
+    labels = (labels + batch) % (2 * batch)
+    loss = F.cross_entropy(sim, labels)
+    return loss
+
+
+class PersonAdjustmentModel(nn.Module):
+    def __init__(self, in_dim, hidden=64, embed_dim=64, out_dim=2, scene_classes=None, proj_dim=None):
+        super(PersonAdjustmentModel, self).__init__()
+        self.trunk = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, embed_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.reg_head = nn.Linear(embed_dim, out_dim)
+        self.scene_head = None
+        self.proj_head = None
+        if scene_classes is not None:
+            self.scene_head = nn.Linear(embed_dim, int(scene_classes))
+        if proj_dim is not None:
+            self.proj_head = nn.Sequential(
+                nn.Linear(embed_dim, proj_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(proj_dim, proj_dim),
+            )
+
+    def forward(self, x, return_dict=False):
+        emb = self.trunk(x)
+        pred = self.reg_head(emb)
+        if not return_dict:
+            return pred
+        out = {"pred": pred, "embedding": emb}
+        if self.scene_head is not None:
+            out["scene_logits"] = self.scene_head(emb)
+        if self.proj_head is not None:
+            out["proj"] = self.proj_head(emb)
+        return out
+
+
 class PersonAdjustmentPredictor(nn.Module):
     def __init__(self, in_dim, hidden=64, out_dim=2):
         super(PersonAdjustmentPredictor, self).__init__()
@@ -224,6 +374,15 @@ def train_predictor(
     lr=1e-3,
     weight_decay=1e-4,
     hidden=64,
+    embed_dim=64,
+    batch_size=256,
+    scene_labels=None,
+    scene_weight=0.2,
+    contrastive_weight=0.0,
+    contrastive_temperature=0.1,
+    contrastive_proj_dim=32,
+    augment_noise_std=0.01,
+    augment_dropout_prob=0.1,
     device="cpu",
     val_ratio=0.1,
 ):
@@ -245,25 +404,73 @@ def train_predictor(
     x_val = standardizer.transform(features[val_idx]) if val_idx.size > 0 else None
     y_val = targets[val_idx] if val_idx.size > 0 else None
 
+    scene_train = None
+    scene_val = None
+    scene_classes = None
+    if scene_labels is not None:
+        scene_labels = np.asarray(scene_labels, dtype=np.int64)
+        if scene_labels.shape[0] != features.shape[0]:
+            raise ValueError("scene_labels length mismatch")
+        scene_train = scene_labels[train_idx]
+        scene_val = scene_labels[val_idx] if val_idx.size > 0 else None
+        scene_classes = int(scene_labels.max()) + 1
+
     device = torch.device(device)
-    model = PersonAdjustmentPredictor(in_dim=features.shape[1], hidden=hidden, out_dim=targets.shape[1])
+    use_contrastive = contrastive_weight > 0.0
+    proj_dim = contrastive_proj_dim if use_contrastive else None
+    model = PersonAdjustmentModel(
+        in_dim=features.shape[1],
+        hidden=hidden,
+        embed_dim=embed_dim,
+        out_dim=targets.shape[1],
+        scene_classes=scene_classes,
+        proj_dim=proj_dim,
+    )
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = nn.L1Loss()
 
     x_train_t = torch.from_numpy(x_train).to(device)
     y_train_t = torch.from_numpy(y_train).to(device)
+    scene_train_t = torch.from_numpy(scene_train).to(device) if scene_train is not None else None
+
+    if batch_size is None or batch_size <= 0:
+        batch_size = x_train_t.size(0)
+
+    num_batches = int(math.ceil(x_train_t.size(0) / float(batch_size)))
 
     for epoch in range(epochs):
         model.train()
-        pred = model(x_train_t)
-        loss = loss_fn(pred, y_train_t)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        perm = torch.randperm(x_train_t.size(0), device=device)
+        epoch_loss = 0.0
+        for b in range(num_batches):
+            idx = perm[b * batch_size : (b + 1) * batch_size]
+            xb = x_train_t[idx]
+            yb = y_train_t[idx]
+            sb = scene_train_t[idx] if scene_train_t is not None else None
+
+            out = model(xb, return_dict=True)
+            loss = loss_fn(out["pred"], yb)
+
+            if sb is not None and out.get("scene_logits") is not None:
+                loss = loss + scene_weight * F.cross_entropy(out["scene_logits"], sb)
+
+            if use_contrastive and out.get("proj") is not None:
+                xb1 = augment_features_torch(xb, augment_noise_std, augment_dropout_prob)
+                xb2 = augment_features_torch(xb, augment_noise_std, augment_dropout_prob)
+                out1 = model(xb1, return_dict=True)
+                out2 = model(xb2, return_dict=True)
+                loss = loss + contrastive_weight * nt_xent_loss(
+                    out1["proj"], out2["proj"], temperature=contrastive_temperature
+                )
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
 
         if (epoch + 1) % 50 == 0:
-            msg = "Epoch {}/{} loss {:.6f}".format(epoch + 1, epochs, loss.item())
+            msg = "Epoch {}/{} loss {:.6f}".format(epoch + 1, epochs, epoch_loss / num_batches)
             if x_val is not None and x_val.size > 0:
                 model.eval()
                 with torch.no_grad():
@@ -275,16 +482,22 @@ def train_predictor(
     return model, standardizer
 
 
-def save_predictor(model, standardizer, save_dir):
+def save_predictor(model, standardizer, save_dir, config=None, hist_projector=None):
     os.makedirs(save_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(save_dir, "predictor.pth"))
     with open(os.path.join(save_dir, "standardizer.json"), "w") as f:
         json.dump(standardizer.to_dict(), f, indent=2)
+    if hist_projector is not None:
+        with open(os.path.join(save_dir, "hist_projector.json"), "w") as f:
+            json.dump(hist_projector.to_dict(), f, indent=2)
+    if config is not None:
+        with open(os.path.join(save_dir, "predictor_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
 
 
-def load_predictor(model_path, standardizer_path, in_dim, hidden=64, device="cpu"):
+def load_predictor(model_path, standardizer_path, in_dim, hidden=64, embed_dim=64, out_dim=2, device="cpu"):
     device = torch.device(device)
-    model = PersonAdjustmentPredictor(in_dim=in_dim, hidden=hidden, out_dim=2)
+    model = PersonAdjustmentPredictor(in_dim=in_dim, hidden=hidden, out_dim=out_dim)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.to(device)
     model.eval()
@@ -293,12 +506,146 @@ def load_predictor(model_path, standardizer_path, in_dim, hidden=64, device="cpu
     return model, standardizer
 
 
+def load_predictor_bundle(load_dir, device="cpu"):
+    model_path = os.path.join(load_dir, "predictor.pth")
+    standardizer_path = os.path.join(load_dir, "standardizer.json")
+    config_path = os.path.join(load_dir, "predictor_config.json")
+    hist_proj_path = os.path.join(load_dir, "hist_projector.json")
+
+    config = None
+    if os.path.isfile(config_path):
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+    if config is None:
+        raise ValueError("predictor_config.json not found in {}".format(load_dir))
+
+    device = torch.device(device)
+    model_type = config.get("model", "predictor")
+    if model_type == "advanced":
+        model = PersonAdjustmentModel(
+            in_dim=int(config["in_dim"]),
+            hidden=int(config.get("hidden", 64)),
+            embed_dim=int(config.get("embed_dim", 64)),
+            out_dim=int(config.get("out_dim", 2)),
+            scene_classes=config.get("scene_classes"),
+            proj_dim=config.get("proj_dim"),
+        )
+    else:
+        model = PersonAdjustmentPredictor(
+            in_dim=int(config["in_dim"]),
+            hidden=int(config.get("hidden", 64)),
+            out_dim=int(config.get("out_dim", 2)),
+        )
+
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device)
+    model.eval()
+
+    with open(standardizer_path, "r") as f:
+        standardizer = Standardizer.from_dict(json.load(f))
+
+    hist_projector = None
+    if os.path.isfile(hist_proj_path):
+        with open(hist_proj_path, "r") as f:
+            hist_projector = HistogramProjector.from_dict(json.load(f))
+
+    return model, standardizer, hist_projector, config
+
+
 def build_person_adjustments(num_classes, person_class, gain, bias):
     gains = np.ones((num_classes,), dtype=np.float32)
     biases = np.zeros((num_classes,), dtype=np.float32)
     gains[int(person_class)] = float(gain)
     biases[int(person_class)] = float(bias)
     return {"class": {"gain": gains, "bias": biases}}
+
+
+def build_hdrnet_semantic_adjustments(
+    num_classes,
+    person_class,
+    coeff_scale,
+    coeff_bias,
+    guide_bias,
+    coeffs=12,
+):
+    coeff_scale_map = np.ones((num_classes, coeffs), dtype=np.float32)
+    coeff_bias_map = np.zeros((num_classes, coeffs), dtype=np.float32)
+    coeff_scale_map[int(person_class)] = float(coeff_scale)
+    coeff_bias_map[int(person_class)] = float(coeff_bias)
+    guide_bias_map = np.zeros((num_classes,), dtype=np.float32)
+    guide_bias_map[int(person_class)] = float(guide_bias)
+    return {
+        "coeff_scale": coeff_scale_map,
+        "coeff_bias": coeff_bias_map,
+        "guide_bias": guide_bias_map,
+    }
+
+
+def build_hdrnet_mix_adjustments(num_classes, person_class, mix):
+    mix_map = np.zeros((num_classes,), dtype=np.float32)
+    mix_map[int(person_class)] = float(mix)
+    return mix_map
+
+
+def decode_predictions(
+    pred,
+    gain_range=(0.25, 4.0),
+    bias_range=(-0.3, 0.3),
+    coeff_scale_range=0.5,
+    coeff_bias_range=0.25,
+    guide_bias_range=0.25,
+):
+    gain = float(pred[0])
+    bias = float(pred[1])
+    gain = max(gain_range[0], min(gain_range[1], gain))
+    bias = max(bias_range[0], min(bias_range[1], bias))
+
+    hdrnet = None
+    if pred.shape[0] >= 6:
+        mix = 1.0 / (1.0 + np.exp(-float(pred[2])))
+        guide_bias = float(pred[3])
+        coeff_scale = float(pred[4])
+        coeff_bias = float(pred[5])
+
+        guide_bias = max(-guide_bias_range, min(guide_bias_range, guide_bias))
+        coeff_scale = max(1.0 - coeff_scale_range, min(1.0 + coeff_scale_range, coeff_scale))
+        coeff_bias = max(-coeff_bias_range, min(coeff_bias_range, coeff_bias))
+        hdrnet = {
+            "mix": mix,
+            "guide_bias": guide_bias,
+            "coeff_scale": coeff_scale,
+            "coeff_bias": coeff_bias,
+        }
+    return gain, bias, hdrnet
+
+
+def derive_hdrnet_targets(
+    gain,
+    bias,
+    gain_range=(0.25, 4.0),
+    bias_range=(-0.3, 0.3),
+    coeff_scale_range=0.5,
+    coeff_bias_range=0.25,
+    guide_bias_range=0.25,
+    mix_slope=2.0,
+):
+    gain = float(gain)
+    bias = float(bias)
+    gain_span = max(1e-6, max(gain_range[1] - 1.0, 1.0 - gain_range[0]))
+    gain_norm = (gain - 1.0) / gain_span
+    gain_norm = max(-1.0, min(1.0, gain_norm))
+
+    bias_span = max(abs(bias_range[0]), abs(bias_range[1]), 1e-6)
+    bias_norm = bias / bias_span
+    bias_norm = max(-1.0, min(1.0, bias_norm))
+
+    mix = 1.0 / (1.0 + math.exp(-mix_slope * gain_norm))
+    coeff_scale = 1.0 + coeff_scale_range * gain_norm
+    coeff_bias = coeff_bias_range * bias_norm
+    guide_bias = guide_bias_range * bias_norm
+    mix_logit = math.log(max(1e-6, min(1.0 - 1e-6, mix)) / max(1e-6, 1.0 - mix))
+    return mix_logit, guide_bias, coeff_scale, coeff_bias
 
 
 def predict_person_adjustments(
@@ -310,13 +657,77 @@ def predict_person_adjustments(
     person_class,
     num_classes,
     bins=16,
+    quantiles=None,
+    quantile_degree=2,
+    hist_projector=None,
+    include_raw_hist=True,
     device="cpu",
 ):
-    features = compute_features(linear_16, seg_map, exposure_ev, person_class, bins=bins)
+    features = compute_features(
+        linear_16,
+        seg_map,
+        exposure_ev,
+        person_class,
+        bins=bins,
+        quantiles=quantiles,
+        quantile_degree=quantile_degree,
+        hist_projector=hist_projector,
+        include_raw_hist=include_raw_hist,
+    )
     x = standardizer.transform(features[None, :])
     x_t = torch.from_numpy(x).to(device)
     model.eval()
     with torch.no_grad():
         pred = model(x_t).cpu().numpy()[0]
-    gain, bias = float(pred[0]), float(pred[1])
+    gain, bias, _ = decode_predictions(pred)
     return build_person_adjustments(num_classes, person_class, gain, bias)
+
+
+def predict_person_hdrnet_adjustments(
+    model,
+    standardizer,
+    linear_16,
+    seg_map,
+    exposure_ev,
+    person_class,
+    num_classes,
+    bins=16,
+    quantiles=None,
+    quantile_degree=2,
+    hist_projector=None,
+    include_raw_hist=True,
+    coeffs=12,
+    device="cpu",
+):
+    features = compute_features(
+        linear_16,
+        seg_map,
+        exposure_ev,
+        person_class,
+        bins=bins,
+        quantiles=quantiles,
+        quantile_degree=quantile_degree,
+        hist_projector=hist_projector,
+        include_raw_hist=include_raw_hist,
+    )
+    x = standardizer.transform(features[None, :])
+    x_t = torch.from_numpy(x).to(device)
+    model.eval()
+    with torch.no_grad():
+        pred = model(x_t).cpu().numpy()[0]
+
+    gain, bias, hdrnet = decode_predictions(pred)
+    adjustments = {
+        "base": build_person_adjustments(num_classes, person_class, gain, bias),
+    }
+    if hdrnet is not None:
+        adjustments["mix"] = build_hdrnet_mix_adjustments(num_classes, person_class, hdrnet["mix"])
+        adjustments["hdrnet_semantic"] = build_hdrnet_semantic_adjustments(
+            num_classes,
+            person_class,
+            hdrnet["coeff_scale"],
+            hdrnet["coeff_bias"],
+            hdrnet["guide_bias"],
+            coeffs=coeffs,
+        )
+    return adjustments
