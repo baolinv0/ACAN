@@ -4,6 +4,7 @@ from .semantic_tone_mapper import tone_mapping_loss
 from .hdrnet_tone_mapper import SemanticHDRNetToneMapper
 from .adjustment_selector import flatten_adjustments
 from .adjustment_selector import vector_to_adjustments
+from .scale_coefficient_redefinition import ScaleCoefficientRedefiner
 from .person_adjustment_predictor import HistogramProjector
 from .person_adjustment_predictor import PersonAdjustmentModel
 from .person_adjustment_predictor import PersonAdjustmentPredictor
@@ -13,6 +14,7 @@ __all__ = [
     "SemanticHDRNetToneMapper",
     "flatten_adjustments",
     "vector_to_adjustments",
+    "ScaleCoefficientRedefiner",
     "HistogramProjector",
     "PersonAdjustmentModel",
     "PersonAdjustmentPredictor",
