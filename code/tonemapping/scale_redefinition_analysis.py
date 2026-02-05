@@ -305,6 +305,11 @@ def main():
             "target_kind": target_kind,
             "num_types": int(args.num_types),
             "num_classes": int(args.num_classes),
+            "scale_key": args.scale_key,
+            "coeff_reduce": args.coeff_reduce,
+            "residual_mode": args.residual_mode,
+            "coeffs": int(args.coeffs),
+            "hist_bins": int(args.hist_bins),
         }
         save_predictor(model, standardizer, args.output_dir, config=config)
 

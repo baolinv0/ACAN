@@ -5,6 +5,8 @@ from .hdrnet_tone_mapper import SemanticHDRNetToneMapper
 from .adjustment_selector import flatten_adjustments
 from .adjustment_selector import vector_to_adjustments
 from .scale_coefficient_redefinition import ScaleCoefficientRedefiner
+from .scale_prediction_pipeline import ScalePredictionPipeline
+from .scale_prediction_pipeline import load_scale_prediction_pipeline
 from .type_classifier import TypeClassifier
 from .type_classifier import load_type_classifier
 from .type_classifier import load_type_classifier_bundle
@@ -18,6 +20,8 @@ __all__ = [
     "flatten_adjustments",
     "vector_to_adjustments",
     "ScaleCoefficientRedefiner",
+    "ScalePredictionPipeline",
+    "load_scale_prediction_pipeline",
     "TypeClassifier",
     "load_type_classifier",
     "load_type_classifier_bundle",
