@@ -24,6 +24,12 @@ def _safe_atanh(x, eps=1e-6):
     return math.atanh(x)
 
 
+def _box_filter(x, window):
+    if window <= 1:
+        return x
+    return F.avg_pool2d(x, window, stride=1, padding=window // 2)
+
+
 class SemanticToneMapper(nn.Module):
     """
     Tone mapper with semantic class conditioning.
@@ -53,6 +59,10 @@ class SemanticToneMapper(nn.Module):
         local_gain_range=0.8,
         local_bias_range=0.15,
         local_enable=True,
+        local_method="box",
+        guided_eps=1e-3,
+        bilateral_sigma_spatial=None,
+        bilateral_sigma_range=0.1,
         eps=1e-6,
     ):
         super(SemanticToneMapper, self).__init__()
@@ -69,6 +79,10 @@ class SemanticToneMapper(nn.Module):
         self.local_gain_range = float(local_gain_range)
         self.local_bias_range = float(local_bias_range)
         self.local_enable = bool(local_enable)
+        self.local_method = self._normalize_local_method(local_method)
+        self.guided_eps = float(guided_eps)
+        self.bilateral_sigma_spatial = bilateral_sigma_spatial
+        self.bilateral_sigma_range = float(bilateral_sigma_range)
         self.eps = float(eps)
 
         # Use log-domain or softplus to keep parameters in valid ranges.
@@ -146,6 +160,10 @@ class SemanticToneMapper(nn.Module):
                 "gain_strength": l_gain.detach().cpu().numpy(),
                 "bias_strength": l_bias.detach().cpu().numpy(),
                 "window": int(self.local_window),
+                "method": self._normalize_local_method(self.local_method),
+                "guided_eps": float(self.guided_eps),
+                "bilateral_sigma_spatial": self.bilateral_sigma_spatial,
+                "bilateral_sigma_range": float(self.bilateral_sigma_range),
                 "enable": bool(self.local_enable),
             },
         }
@@ -292,6 +310,23 @@ class SemanticToneMapper(nn.Module):
                 self.local_window = self._normalize_local_window(l["window"])
             if "enable" in l and l["enable"] is not None:
                 self.local_enable = bool(l["enable"])
+            if "method" in l and l["method"] is not None:
+                self.local_method = self._normalize_local_method(l["method"])
+            if "guided_eps" in l and l["guided_eps"] is not None:
+                self.guided_eps = float(l["guided_eps"])
+            if "bilateral_sigma_spatial" in l and l["bilateral_sigma_spatial"] is not None:
+                self.bilateral_sigma_spatial = float(l["bilateral_sigma_spatial"])
+            if "bilateral_sigma_range" in l and l["bilateral_sigma_range"] is not None:
+                self.bilateral_sigma_range = float(l["bilateral_sigma_range"])
+
+        if "local_method" in params and params["local_method"] is not None:
+            self.local_method = self._normalize_local_method(params["local_method"])
+        if "guided_eps" in params and params["guided_eps"] is not None:
+            self.guided_eps = float(params["guided_eps"])
+        if "bilateral_sigma_spatial" in params and params["bilateral_sigma_spatial"] is not None:
+            self.bilateral_sigma_spatial = float(params["bilateral_sigma_spatial"])
+        if "bilateral_sigma_range" in params and params["bilateral_sigma_range"] is not None:
+            self.bilateral_sigma_range = float(params["bilateral_sigma_range"])
 
     def _ensure_tensor(self, x, device, dtype):
         if torch.is_tensor(x):
@@ -326,11 +361,89 @@ class SemanticToneMapper(nn.Module):
             window += 1
         return window
 
-    def _local_adjust(self, linear_16, seg_map, local_gain_strength, local_bias_strength, window):
+    def _normalize_local_method(self, method):
+        if method is None:
+            method = getattr(self, "local_method", "box")
+        method = str(method).lower()
+        if method not in ("box", "guided", "bilateral"):
+            raise ValueError("local_method must be one of: box, guided, bilateral")
+        return method
+
+    def _guided_filter(self, guidance, inp, window, eps):
+        mean_g = _box_filter(guidance, window)
+        mean_p = _box_filter(inp, window)
+        corr_g = _box_filter(guidance * guidance, window)
+        corr_gp = _box_filter(guidance * inp, window)
+        var_g = corr_g - mean_g * mean_g
+        cov_gp = corr_gp - mean_g * mean_p
+        a = cov_gp / (var_g + eps)
+        b = mean_p - a * mean_g
+        mean_a = _box_filter(a, window)
+        mean_b = _box_filter(b, window)
+        return mean_a * guidance + mean_b
+
+    def _bilateral_filter(self, inp, window, sigma_spatial, sigma_range):
+        if window <= 1:
+            return inp
+        radius = window // 2
+        if sigma_spatial is None or sigma_spatial <= 0:
+            sigma_spatial = max(1.0, float(window) / 3.0)
+        if sigma_range is None or sigma_range <= 0:
+            sigma_range = 1e-3
+
+        device = inp.device
+        dtype = inp.dtype
+        coords = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+        try:
+            yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+        except TypeError:
+            yy, xx = torch.meshgrid(coords, coords)
+        spatial = torch.exp(-(xx * xx + yy * yy) / (2.0 * sigma_spatial * sigma_spatial))
+        spatial = spatial.reshape(1, -1, 1, 1)
+
+        pad = [radius, radius, radius, radius]
+        padded = F.pad(inp, pad, mode="reflect")
+        patches = F.unfold(padded, kernel_size=window)
+        b, k, hw = patches.shape
+        patches = patches.view(b, k, inp.size(2), inp.size(3))
+        center = inp
+        range_w = torch.exp(-((patches - center) ** 2) / (2.0 * sigma_range * sigma_range))
+        weights = spatial * range_w
+        weighted = (weights * patches).sum(dim=1, keepdim=True)
+        norm = weights.sum(dim=1, keepdim=True) + self.eps
+        return weighted / norm
+
+    def _compute_local_mean(
+        self, luminance, window, method, guided_eps, bilateral_sigma_spatial, bilateral_sigma_range
+    ):
+        if method == "box":
+            return _box_filter(luminance, window)
+        if method == "guided":
+            return self._guided_filter(luminance, luminance, window, guided_eps)
+        if method == "bilateral":
+            return self._bilateral_filter(
+                luminance, window, bilateral_sigma_spatial, bilateral_sigma_range
+            )
+        raise ValueError("Unsupported local method: {}".format(method))
+
+    def _local_adjust(
+        self,
+        linear_16,
+        seg_map,
+        local_gain_strength,
+        local_bias_strength,
+        window,
+        method,
+        guided_eps,
+        bilateral_sigma_spatial,
+        bilateral_sigma_range,
+    ):
         if window <= 1:
             return None, None
         luminance = linear_16.mean(dim=1, keepdim=True)
-        local_mean = F.avg_pool2d(luminance, window, stride=1, padding=window // 2)
+        local_mean = self._compute_local_mean(
+            luminance, window, method, guided_eps, bilateral_sigma_spatial, bilateral_sigma_range
+        )
         global_mean = luminance.mean(dim=(2, 3), keepdim=True)
         delta = (local_mean - global_mean) / (global_mean + self.eps)
 
@@ -371,12 +484,33 @@ class SemanticToneMapper(nn.Module):
         l_bias,
         use_local,
         local_window,
+        local_method,
+        guided_eps,
+        bilateral_sigma_spatial,
+        bilateral_sigma_range,
         adjustments,
         device,
         dtype,
     ):
         if not adjustments:
-            return gain, gamma, white, bias, g_gain, g_gamma, g_white, g_bias, l_gain, l_bias, use_local, local_window
+            return (
+                gain,
+                gamma,
+                white,
+                bias,
+                g_gain,
+                g_gamma,
+                g_white,
+                g_bias,
+                l_gain,
+                l_bias,
+                use_local,
+                local_window,
+                local_method,
+                guided_eps,
+                bilateral_sigma_spatial,
+                bilateral_sigma_range,
+            )
 
         if "global" in adjustments and adjustments["global"] is not None:
             g_adj = adjustments["global"]
@@ -410,13 +544,46 @@ class SemanticToneMapper(nn.Module):
                 use_local = bool(l_adj["enable"])
             if "window" in l_adj and l_adj["window"] is not None:
                 local_window = self._normalize_local_window(l_adj["window"])
+            if "method" in l_adj and l_adj["method"] is not None:
+                local_method = self._normalize_local_method(l_adj["method"])
+            if "guided_eps" in l_adj and l_adj["guided_eps"] is not None:
+                guided_eps = float(l_adj["guided_eps"])
+            if "bilateral_sigma_spatial" in l_adj and l_adj["bilateral_sigma_spatial"] is not None:
+                bilateral_sigma_spatial = float(l_adj["bilateral_sigma_spatial"])
+            if "bilateral_sigma_range" in l_adj and l_adj["bilateral_sigma_range"] is not None:
+                bilateral_sigma_range = float(l_adj["bilateral_sigma_range"])
 
         if "local_enable" in adjustments and adjustments["local_enable"] is not None:
             use_local = bool(adjustments["local_enable"])
         if "local_window" in adjustments and adjustments["local_window"] is not None:
             local_window = self._normalize_local_window(adjustments["local_window"])
+        if "local_method" in adjustments and adjustments["local_method"] is not None:
+            local_method = self._normalize_local_method(adjustments["local_method"])
+        if "guided_eps" in adjustments and adjustments["guided_eps"] is not None:
+            guided_eps = float(adjustments["guided_eps"])
+        if "bilateral_sigma_spatial" in adjustments and adjustments["bilateral_sigma_spatial"] is not None:
+            bilateral_sigma_spatial = float(adjustments["bilateral_sigma_spatial"])
+        if "bilateral_sigma_range" in adjustments and adjustments["bilateral_sigma_range"] is not None:
+            bilateral_sigma_range = float(adjustments["bilateral_sigma_range"])
 
-        return gain, gamma, white, bias, g_gain, g_gamma, g_white, g_bias, l_gain, l_bias, use_local, local_window
+        return (
+            gain,
+            gamma,
+            white,
+            bias,
+            g_gain,
+            g_gamma,
+            g_white,
+            g_bias,
+            l_gain,
+            l_bias,
+            use_local,
+            local_window,
+            local_method,
+            guided_eps,
+            bilateral_sigma_spatial,
+            bilateral_sigma_range,
+        )
 
     def _prepare_inputs(self, linear_16, seg_map):
         if not torch.is_tensor(linear_16):
@@ -464,6 +631,10 @@ class SemanticToneMapper(nn.Module):
         normalize_input=True,
         use_local=None,
         local_window=None,
+        local_method=None,
+        guided_eps=None,
+        bilateral_sigma_spatial=None,
+        bilateral_sigma_range=None,
         adjustments=None,
     ):
         input_was_unbatched = linear_16.dim() == 3
@@ -487,6 +658,13 @@ class SemanticToneMapper(nn.Module):
         if use_local is None:
             use_local = self.local_enable
         local_window = self._normalize_local_window(local_window)
+        local_method = self._normalize_local_method(local_method)
+        if guided_eps is None:
+            guided_eps = self.guided_eps
+        if bilateral_sigma_spatial is None:
+            bilateral_sigma_spatial = self.bilateral_sigma_spatial
+        if bilateral_sigma_range is None:
+            bilateral_sigma_range = self.bilateral_sigma_range
 
         (
             gain,
@@ -501,6 +679,10 @@ class SemanticToneMapper(nn.Module):
             l_bias,
             use_local,
             local_window,
+            local_method,
+            guided_eps,
+            bilateral_sigma_spatial,
+            bilateral_sigma_range,
         ) = self._apply_adjustments(
             gain,
             gamma,
@@ -514,6 +696,10 @@ class SemanticToneMapper(nn.Module):
             l_bias,
             use_local,
             local_window,
+            local_method,
+            guided_eps,
+            bilateral_sigma_spatial,
+            bilateral_sigma_range,
             adjustments,
             linear_16.device,
             linear_16.dtype,
@@ -526,7 +712,15 @@ class SemanticToneMapper(nn.Module):
 
         if use_local and local_window > 1:
             local_gain, local_bias = self._local_adjust(
-                linear_16, seg_map, l_gain, l_bias, local_window
+                linear_16,
+                seg_map,
+                l_gain,
+                l_bias,
+                local_window,
+                local_method,
+                guided_eps,
+                bilateral_sigma_spatial,
+                bilateral_sigma_range,
             )
             if local_gain is not None:
                 gain_map = gain_map * local_gain

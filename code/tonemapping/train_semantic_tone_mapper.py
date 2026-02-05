@@ -7,8 +7,10 @@ from torch.utils.data import DataLoader
 
 try:
     from .semantic_tone_mapper import SemanticToneMapper, ToneMappingDataset, tone_mapping_loss
+    from .hdrnet_tone_mapper import SemanticHDRNetToneMapper
 except ImportError:
     from semantic_tone_mapper import SemanticToneMapper, ToneMappingDataset, tone_mapping_loss
+    from hdrnet_tone_mapper import SemanticHDRNetToneMapper
 
 
 def _set_seed(seed):
@@ -33,22 +35,47 @@ def train(args):
     )
 
     device = torch.device(args.device)
-    model = SemanticToneMapper(
-        num_classes=args.num_classes,
-        init_gain=args.init_gain,
-        init_gamma=args.init_gamma,
-        init_white=args.init_white,
-        init_global_gain=args.init_global_gain,
-        init_global_gamma=args.init_global_gamma,
-        init_global_white=args.init_global_white,
-        bias_range=args.bias_range,
-        global_bias_range=args.global_bias_range,
-        max_input=args.max_input,
-        local_window=args.local_window,
-        local_gain_range=args.local_gain_range,
-        local_bias_range=args.local_bias_range,
-        local_enable=not args.disable_local,
-    )
+    base_kwargs = {
+        "init_gain": args.init_gain,
+        "init_gamma": args.init_gamma,
+        "init_white": args.init_white,
+        "init_global_gain": args.init_global_gain,
+        "init_global_gamma": args.init_global_gamma,
+        "init_global_white": args.init_global_white,
+        "bias_range": args.bias_range,
+        "global_bias_range": args.global_bias_range,
+        "max_input": args.max_input,
+        "local_window": args.local_window,
+        "local_gain_range": args.local_gain_range,
+        "local_bias_range": args.local_bias_range,
+        "local_enable": not args.disable_local,
+        "local_method": args.local_method,
+        "guided_eps": args.guided_eps,
+        "bilateral_sigma_spatial": args.bilateral_sigma_spatial,
+        "bilateral_sigma_range": args.bilateral_sigma_range,
+    }
+
+    if args.model == "hdrnet":
+        base_kwargs["local_enable"] = bool(args.hdrnet_base_local)
+        hdrnet_kwargs = {
+            "grid_depth": args.hdrnet_grid_depth,
+            "grid_height": args.hdrnet_grid_height,
+            "grid_width": args.hdrnet_grid_width,
+            "coeffs": args.hdrnet_coeffs,
+            "embedding_dim": args.hdrnet_embedding_dim,
+            "hidden": args.hdrnet_hidden,
+            "guide_hidden": args.hdrnet_guide_hidden,
+            "use_exposure": not args.hdrnet_disable_exposure,
+        }
+        model = SemanticHDRNetToneMapper(
+            num_classes=args.num_classes,
+            base_kwargs=base_kwargs,
+            hdrnet_kwargs=hdrnet_kwargs,
+            mix_init=args.hdrnet_mix_init,
+            base_use_local=args.hdrnet_base_local,
+        )
+    else:
+        model = SemanticToneMapper(num_classes=args.num_classes, **base_kwargs)
     model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -73,14 +100,7 @@ def train(args):
             gt = gt.to(device)
             ev = ev.to(device)
 
-            pred = model(
-                linear,
-                seg,
-                exposure_ev=ev,
-                normalize_input=True,
-                use_local=not args.disable_local,
-                local_window=args.local_window,
-            )
+            pred = model(linear, seg, exposure_ev=ev, normalize_input=True)
             loss = tone_mapping_loss(pred, gt, use_smooth_l1=args.use_smooth_l1)
 
             optimizer.zero_grad()
@@ -134,6 +154,7 @@ def build_parser():
     parser.add_argument("--manifest", required=True, help="CSV manifest path")
     parser.add_argument("--data-root", default=None, help="Root for relative paths")
     parser.add_argument("--num-classes", type=int, required=True, help="Number of semantic classes")
+    parser.add_argument("--model", choices=["curve", "hdrnet"], default="curve")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -152,7 +173,21 @@ def build_parser():
     parser.add_argument("--local-window", type=int, default=9)
     parser.add_argument("--local-gain-range", type=float, default=0.8)
     parser.add_argument("--local-bias-range", type=float, default=0.15)
+    parser.add_argument("--local-method", default="box", choices=["box", "guided", "bilateral"])
+    parser.add_argument("--guided-eps", type=float, default=1e-3)
+    parser.add_argument("--bilateral-sigma-spatial", type=float, default=None)
+    parser.add_argument("--bilateral-sigma-range", type=float, default=0.1)
     parser.add_argument("--disable-local", action="store_true")
+    parser.add_argument("--hdrnet-base-local", action="store_true")
+    parser.add_argument("--hdrnet-mix-init", type=float, default=0.5)
+    parser.add_argument("--hdrnet-grid-depth", type=int, default=8)
+    parser.add_argument("--hdrnet-grid-height", type=int, default=16)
+    parser.add_argument("--hdrnet-grid-width", type=int, default=16)
+    parser.add_argument("--hdrnet-coeffs", type=int, default=12)
+    parser.add_argument("--hdrnet-embedding-dim", type=int, default=8)
+    parser.add_argument("--hdrnet-hidden", type=int, default=32)
+    parser.add_argument("--hdrnet-guide-hidden", type=int, default=16)
+    parser.add_argument("--hdrnet-disable-exposure", action="store_true")
     parser.add_argument("--use-smooth-l1", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=20)
