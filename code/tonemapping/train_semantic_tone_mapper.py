@@ -38,8 +38,16 @@ def train(args):
         init_gain=args.init_gain,
         init_gamma=args.init_gamma,
         init_white=args.init_white,
+        init_global_gain=args.init_global_gain,
+        init_global_gamma=args.init_global_gamma,
+        init_global_white=args.init_global_white,
         bias_range=args.bias_range,
+        global_bias_range=args.global_bias_range,
         max_input=args.max_input,
+        local_window=args.local_window,
+        local_gain_range=args.local_gain_range,
+        local_bias_range=args.local_bias_range,
+        local_enable=not args.disable_local,
     )
     model.to(device)
 
@@ -65,7 +73,14 @@ def train(args):
             gt = gt.to(device)
             ev = ev.to(device)
 
-            pred = model(linear, seg, exposure_ev=ev, normalize_input=True)
+            pred = model(
+                linear,
+                seg,
+                exposure_ev=ev,
+                normalize_input=True,
+                use_local=not args.disable_local,
+                local_window=args.local_window,
+            )
             loss = tone_mapping_loss(pred, gt, use_smooth_l1=args.use_smooth_l1)
 
             optimizer.zero_grad()
@@ -128,8 +143,16 @@ def build_parser():
     parser.add_argument("--init-gain", type=float, default=1.0)
     parser.add_argument("--init-gamma", type=float, default=2.2)
     parser.add_argument("--init-white", type=float, default=4.0)
+    parser.add_argument("--init-global-gain", type=float, default=1.0)
+    parser.add_argument("--init-global-gamma", type=float, default=1.0)
+    parser.add_argument("--init-global-white", type=float, default=1.0)
     parser.add_argument("--bias-range", type=float, default=0.30)
+    parser.add_argument("--global-bias-range", type=float, default=None)
     parser.add_argument("--max-input", type=float, default=8.0)
+    parser.add_argument("--local-window", type=int, default=9)
+    parser.add_argument("--local-gain-range", type=float, default=0.8)
+    parser.add_argument("--local-bias-range", type=float, default=0.15)
+    parser.add_argument("--disable-local", action="store_true")
     parser.add_argument("--use-smooth-l1", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=20)

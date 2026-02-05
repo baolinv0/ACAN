@@ -1,7 +1,7 @@
 """
 Semantic-adjustable tone mapping for 16-bit linear input.
-This module provides a learnable per-class tone curve, GT supervision,
-and LUT export for mobile ISP deployment.
+This module provides global + local adjustments, learnable per-class curves,
+GT supervision, and LUT export for mobile ISP deployment.
 """
 
 import csv
@@ -19,6 +19,11 @@ def _inv_softplus(x):
     return torch.log(torch.expm1(x))
 
 
+def _safe_atanh(x, eps=1e-6):
+    x = max(-1.0 + eps, min(1.0 - eps, float(x)))
+    return math.atanh(x)
+
+
 class SemanticToneMapper(nn.Module):
     """
     Tone mapper with semantic class conditioning.
@@ -27,6 +32,7 @@ class SemanticToneMapper(nn.Module):
         linear_16: (B,C,H,W) or (C,H,W), 16-bit linear values (uint16 or float).
         seg_map:   (B,H,W) or (H,W), integer class ids.
         exposure_ev: scalar or (B,), exposure value (EV).
+        adjustments: optional dict for active tuning (global/class/local overrides).
     Output:
         tone mapped image in [0,1], shape matches input (B,C,H,W) or (C,H,W).
     """
@@ -37,8 +43,16 @@ class SemanticToneMapper(nn.Module):
         init_gain=1.0,
         init_gamma=2.2,
         init_white=4.0,
+        init_global_gain=1.0,
+        init_global_gamma=1.0,
+        init_global_white=1.0,
         bias_range=0.30,
+        global_bias_range=None,
         max_input=8.0,
+        local_window=9,
+        local_gain_range=0.8,
+        local_bias_range=0.15,
+        local_enable=True,
         eps=1e-6,
     ):
         super(SemanticToneMapper, self).__init__()
@@ -47,7 +61,14 @@ class SemanticToneMapper(nn.Module):
 
         self.num_classes = int(num_classes)
         self.bias_range = float(bias_range)
+        if global_bias_range is None:
+            global_bias_range = bias_range
+        self.global_bias_range = float(global_bias_range)
         self.max_input = float(max_input)
+        self.local_window = int(local_window)
+        self.local_gain_range = float(local_gain_range)
+        self.local_bias_range = float(local_bias_range)
+        self.local_enable = bool(local_enable)
         self.eps = float(eps)
 
         # Use log-domain or softplus to keep parameters in valid ranges.
@@ -63,12 +84,37 @@ class SemanticToneMapper(nn.Module):
         )
         self.raw_bias = nn.Parameter(torch.zeros(self.num_classes))
 
+        # Global adjustments (image-level).
+        self.log_global_gain = nn.Parameter(torch.log(torch.tensor(float(init_global_gain))))
+        self.log_global_gamma = nn.Parameter(torch.log(torch.tensor(float(init_global_gamma))))
+        init_global_white = max(float(init_global_white), 1.0 + 1e-3)
+        self.raw_global_white = nn.Parameter(
+            _inv_softplus(torch.tensor(init_global_white - 1.0))
+        )
+        self.raw_global_bias = nn.Parameter(torch.tensor(0.0))
+
+        # Local adjustment strengths (per class).
+        self.raw_local_gain = nn.Parameter(torch.zeros(self.num_classes))
+        self.raw_local_bias = nn.Parameter(torch.zeros(self.num_classes))
+
     def _params(self):
         gain = torch.exp(self.log_gain)
         gamma = torch.exp(self.log_gamma) + self.eps
         white = 1.0 + F.softplus(self.raw_white)
         bias = self.bias_range * torch.tanh(self.raw_bias)
         return gain, gamma, white, bias
+
+    def _global_params(self):
+        gain = torch.exp(self.log_global_gain)
+        gamma = torch.exp(self.log_global_gamma) + self.eps
+        white = 1.0 + F.softplus(self.raw_global_white)
+        bias = self.global_bias_range * torch.tanh(self.raw_global_bias)
+        return gain, gamma, white, bias
+
+    def _local_params(self):
+        gain = self.local_gain_range * torch.tanh(self.raw_local_gain)
+        bias = self.local_bias_range * torch.tanh(self.raw_local_bias)
+        return gain, bias
 
     def get_class_params(self):
         gain, gamma, white, bias = self._params()
@@ -77,6 +123,31 @@ class SemanticToneMapper(nn.Module):
             "gamma": gamma.detach().cpu().numpy(),
             "white": white.detach().cpu().numpy(),
             "bias": bias.detach().cpu().numpy(),
+        }
+
+    def get_adjustment_params(self):
+        gain, gamma, white, bias = self._params()
+        g_gain, g_gamma, g_white, g_bias = self._global_params()
+        l_gain, l_bias = self._local_params()
+        return {
+            "class": {
+                "gain": gain.detach().cpu().numpy(),
+                "gamma": gamma.detach().cpu().numpy(),
+                "white": white.detach().cpu().numpy(),
+                "bias": bias.detach().cpu().numpy(),
+            },
+            "global": {
+                "gain": float(g_gain.detach().cpu().item()),
+                "gamma": float(g_gamma.detach().cpu().item()),
+                "white": float(g_white.detach().cpu().item()),
+                "bias": float(g_bias.detach().cpu().item()),
+            },
+            "local": {
+                "gain_strength": l_gain.detach().cpu().numpy(),
+                "bias_strength": l_bias.detach().cpu().numpy(),
+                "window": int(self.local_window),
+                "enable": bool(self.local_enable),
+            },
         }
 
     def set_class_params(self, class_idx, gain=None, gamma=None, white=None, bias=None):
@@ -96,7 +167,131 @@ class SemanticToneMapper(nn.Module):
                 raise ValueError("bias_range must be > 0 to set bias")
             b = float(bias)
             b = max(-self.bias_range, min(self.bias_range, b))
-            self.raw_bias.data[class_idx] = math.atanh(b / self.bias_range)
+            self.raw_bias.data[class_idx] = _safe_atanh(b / self.bias_range)
+
+    def set_global_params(self, gain=None, gamma=None, white=None, bias=None):
+        if gain is not None:
+            self.log_global_gain.data = torch.log(
+                torch.tensor(float(gain), device=self.log_global_gain.device)
+            )
+        if gamma is not None:
+            self.log_global_gamma.data = torch.log(
+                torch.tensor(float(gamma), device=self.log_global_gamma.device)
+            )
+        if white is not None:
+            w = max(float(white), 1.0 + 1e-3)
+            self.raw_global_white.data = _inv_softplus(
+                torch.tensor(w - 1.0, device=self.raw_global_white.device)
+            )
+        if bias is not None:
+            if self.global_bias_range <= 0:
+                raise ValueError("global_bias_range must be > 0 to set bias")
+            b = float(bias)
+            b = max(-self.global_bias_range, min(self.global_bias_range, b))
+            self.raw_global_bias.data = _safe_atanh(b / self.global_bias_range)
+
+    def set_local_params(self, class_idx=None, gain_strength=None, bias_strength=None):
+        if class_idx is None:
+            indices = range(self.num_classes)
+        else:
+            if class_idx < 0 or class_idx >= self.num_classes:
+                raise ValueError("class_idx out of range")
+            indices = [class_idx]
+
+        if gain_strength is not None:
+            g = float(gain_strength)
+            g = max(-self.local_gain_range, min(self.local_gain_range, g))
+            raw_g = (
+                _safe_atanh(g / self.local_gain_range) if self.local_gain_range > 0 else 0.0
+            )
+            for idx in indices:
+                self.raw_local_gain.data[idx] = raw_g
+
+        if bias_strength is not None:
+            b = float(bias_strength)
+            b = max(-self.local_bias_range, min(self.local_bias_range, b))
+            raw_b = (
+                _safe_atanh(b / self.local_bias_range) if self.local_bias_range > 0 else 0.0
+            )
+            for idx in indices:
+                self.raw_local_bias.data[idx] = raw_b
+
+    def set_class_params_all(self, gain=None, gamma=None, white=None, bias=None):
+        device = self.log_gain.device
+        dtype = self.log_gain.dtype
+        if gain is not None:
+            gain_t = self._coerce_class_param(gain, device, dtype)
+            self.log_gain.data = torch.log(gain_t)
+        if gamma is not None:
+            gamma_t = self._coerce_class_param(gamma, device, dtype)
+            self.log_gamma.data = torch.log(gamma_t)
+        if white is not None:
+            white_t = self._coerce_class_param(white, device, dtype)
+            white_t = torch.clamp(white_t, min=1.0 + 1e-3)
+            self.raw_white.data = _inv_softplus(white_t - 1.0)
+        if bias is not None:
+            if self.bias_range <= 0:
+                raise ValueError("bias_range must be > 0 to set bias")
+            bias_t = self._coerce_class_param(bias, device, dtype)
+            bias_t = torch.clamp(bias_t, -self.bias_range, self.bias_range)
+            raw = []
+            for b in bias_t.tolist():
+                raw.append(_safe_atanh(b / self.bias_range))
+            self.raw_bias.data = torch.tensor(raw, device=device, dtype=self.raw_bias.dtype)
+
+    def set_local_params_all(self, gain_strength=None, bias_strength=None):
+        device = self.raw_local_gain.device
+        dtype = self.raw_local_gain.dtype
+        if gain_strength is not None:
+            gain_t = self._coerce_class_param(gain_strength, device, dtype)
+            gain_t = torch.clamp(gain_t, -self.local_gain_range, self.local_gain_range)
+            raw = []
+            for g in gain_t.tolist():
+                if self.local_gain_range > 0:
+                    raw.append(_safe_atanh(g / self.local_gain_range))
+                else:
+                    raw.append(0.0)
+            self.raw_local_gain.data = torch.tensor(raw, device=device, dtype=self.raw_local_gain.dtype)
+        if bias_strength is not None:
+            bias_t = self._coerce_class_param(bias_strength, device, dtype)
+            bias_t = torch.clamp(bias_t, -self.local_bias_range, self.local_bias_range)
+            raw = []
+            for b in bias_t.tolist():
+                if self.local_bias_range > 0:
+                    raw.append(_safe_atanh(b / self.local_bias_range))
+                else:
+                    raw.append(0.0)
+            self.raw_local_bias.data = torch.tensor(raw, device=device, dtype=self.raw_local_bias.dtype)
+
+    def set_adjustment_params(self, params):
+        if not params:
+            return
+        if "global" in params and params["global"] is not None:
+            g = params["global"]
+            self.set_global_params(
+                gain=g.get("gain"),
+                gamma=g.get("gamma"),
+                white=g.get("white"),
+                bias=g.get("bias"),
+            )
+        if "class" in params and params["class"] is not None:
+            c = params["class"]
+            self.set_class_params_all(
+                gain=c.get("gain"),
+                gamma=c.get("gamma"),
+                white=c.get("white"),
+                bias=c.get("bias"),
+            )
+        if "local" in params and params["local"] is not None:
+            l = params["local"]
+            self.set_local_params_all(
+                gain_strength=l.get("gain_strength"),
+                bias_strength=l.get("bias_strength"),
+            )
+            if "window" in l and l["window"] is not None:
+                self.local_window = self._normalize_local_window(l["window"])
+            if "enable" in l and l["enable"] is not None:
+                self.local_enable = bool(l["enable"])
 
     def _ensure_tensor(self, x, device, dtype):
         if torch.is_tensor(x):
@@ -120,6 +315,108 @@ class SemanticToneMapper(nn.Module):
         if ev.dim() == 4:
             return torch.pow(torch.tensor(2.0, device=ev.device, dtype=ev.dtype), ev)
         raise ValueError("Unsupported exposure_ev shape: {}".format(ev.size()))
+
+    def _normalize_local_window(self, local_window):
+        if local_window is None:
+            return self.local_window
+        window = int(local_window)
+        if window < 1:
+            return 1
+        if window % 2 == 0:
+            window += 1
+        return window
+
+    def _local_adjust(self, linear_16, seg_map, local_gain_strength, local_bias_strength, window):
+        if window <= 1:
+            return None, None
+        luminance = linear_16.mean(dim=1, keepdim=True)
+        local_mean = F.avg_pool2d(luminance, window, stride=1, padding=window // 2)
+        global_mean = luminance.mean(dim=(2, 3), keepdim=True)
+        delta = (local_mean - global_mean) / (global_mean + self.eps)
+
+        gain_strength = local_gain_strength[seg_map].unsqueeze(1)
+        bias_strength = local_bias_strength[seg_map].unsqueeze(1)
+
+        local_gain = 1.0 + gain_strength * delta
+        local_bias = bias_strength * delta
+        local_gain = torch.clamp(local_gain, 0.25, 4.0)
+        local_bias = torch.clamp(local_bias, -self.local_bias_range, self.local_bias_range)
+        return local_gain, local_bias
+
+    def _coerce_class_param(self, value, device, dtype):
+        t = self._ensure_tensor(value, device, dtype).flatten()
+        if t.numel() == 1:
+            t = t.repeat(self.num_classes)
+        if t.numel() != self.num_classes:
+            raise ValueError("Class parameter must have num_classes elements")
+        return t
+
+    def _coerce_global_param(self, value, device, dtype):
+        t = self._ensure_tensor(value, device, dtype).flatten()
+        if t.numel() != 1:
+            raise ValueError("Global parameter must be a scalar")
+        return t.squeeze(0)
+
+    def _apply_adjustments(
+        self,
+        gain,
+        gamma,
+        white,
+        bias,
+        g_gain,
+        g_gamma,
+        g_white,
+        g_bias,
+        l_gain,
+        l_bias,
+        use_local,
+        local_window,
+        adjustments,
+        device,
+        dtype,
+    ):
+        if not adjustments:
+            return gain, gamma, white, bias, g_gain, g_gamma, g_white, g_bias, l_gain, l_bias, use_local, local_window
+
+        if "global" in adjustments and adjustments["global"] is not None:
+            g_adj = adjustments["global"]
+            if "gain" in g_adj and g_adj["gain"] is not None:
+                g_gain = self._coerce_global_param(g_adj["gain"], device, dtype)
+            if "gamma" in g_adj and g_adj["gamma"] is not None:
+                g_gamma = self._coerce_global_param(g_adj["gamma"], device, dtype)
+            if "white" in g_adj and g_adj["white"] is not None:
+                g_white = self._coerce_global_param(g_adj["white"], device, dtype)
+            if "bias" in g_adj and g_adj["bias"] is not None:
+                g_bias = self._coerce_global_param(g_adj["bias"], device, dtype)
+
+        if "class" in adjustments and adjustments["class"] is not None:
+            c_adj = adjustments["class"]
+            if "gain" in c_adj and c_adj["gain"] is not None:
+                gain = self._coerce_class_param(c_adj["gain"], device, dtype)
+            if "gamma" in c_adj and c_adj["gamma"] is not None:
+                gamma = self._coerce_class_param(c_adj["gamma"], device, dtype)
+            if "white" in c_adj and c_adj["white"] is not None:
+                white = self._coerce_class_param(c_adj["white"], device, dtype)
+            if "bias" in c_adj and c_adj["bias"] is not None:
+                bias = self._coerce_class_param(c_adj["bias"], device, dtype)
+
+        if "local" in adjustments and adjustments["local"] is not None:
+            l_adj = adjustments["local"]
+            if "gain_strength" in l_adj and l_adj["gain_strength"] is not None:
+                l_gain = self._coerce_class_param(l_adj["gain_strength"], device, dtype)
+            if "bias_strength" in l_adj and l_adj["bias_strength"] is not None:
+                l_bias = self._coerce_class_param(l_adj["bias_strength"], device, dtype)
+            if "enable" in l_adj and l_adj["enable"] is not None:
+                use_local = bool(l_adj["enable"])
+            if "window" in l_adj and l_adj["window"] is not None:
+                local_window = self._normalize_local_window(l_adj["window"])
+
+        if "local_enable" in adjustments and adjustments["local_enable"] is not None:
+            use_local = bool(adjustments["local_enable"])
+        if "local_window" in adjustments and adjustments["local_window"] is not None:
+            local_window = self._normalize_local_window(adjustments["local_window"])
+
+        return gain, gamma, white, bias, g_gain, g_gamma, g_white, g_bias, l_gain, l_bias, use_local, local_window
 
     def _prepare_inputs(self, linear_16, seg_map):
         if not torch.is_tensor(linear_16):
@@ -159,7 +456,16 @@ class SemanticToneMapper(nn.Module):
         y = torch.pow(y + self.eps, 1.0 / gamma)
         return y
 
-    def forward(self, linear_16, seg_map, exposure_ev=None, normalize_input=True):
+    def forward(
+        self,
+        linear_16,
+        seg_map,
+        exposure_ev=None,
+        normalize_input=True,
+        use_local=None,
+        local_window=None,
+        adjustments=None,
+    ):
         input_was_unbatched = linear_16.dim() == 3
 
         linear_16, seg_map = self._prepare_inputs(linear_16, seg_map)
@@ -175,11 +481,56 @@ class SemanticToneMapper(nn.Module):
         linear_16 = linear_16 * scale
 
         gain, gamma, white, bias = self._params()
+        g_gain, g_gamma, g_white, g_bias = self._global_params()
+        l_gain, l_bias = self._local_params()
 
-        gain_map = gain[seg_map].unsqueeze(1)
-        gamma_map = gamma[seg_map].unsqueeze(1)
-        white_map = white[seg_map].unsqueeze(1)
-        bias_map = bias[seg_map].unsqueeze(1)
+        if use_local is None:
+            use_local = self.local_enable
+        local_window = self._normalize_local_window(local_window)
+
+        (
+            gain,
+            gamma,
+            white,
+            bias,
+            g_gain,
+            g_gamma,
+            g_white,
+            g_bias,
+            l_gain,
+            l_bias,
+            use_local,
+            local_window,
+        ) = self._apply_adjustments(
+            gain,
+            gamma,
+            white,
+            bias,
+            g_gain,
+            g_gamma,
+            g_white,
+            g_bias,
+            l_gain,
+            l_bias,
+            use_local,
+            local_window,
+            adjustments,
+            linear_16.device,
+            linear_16.dtype,
+        )
+
+        gain_map = gain[seg_map].unsqueeze(1) * g_gain
+        gamma_map = gamma[seg_map].unsqueeze(1) * g_gamma
+        white_map = white[seg_map].unsqueeze(1) * g_white
+        bias_map = bias[seg_map].unsqueeze(1) + g_bias
+
+        if use_local and local_window > 1:
+            local_gain, local_bias = self._local_adjust(
+                linear_16, seg_map, l_gain, l_bias, local_window
+            )
+            if local_gain is not None:
+                gain_map = gain_map * local_gain
+                bias_map = bias_map + local_bias
 
         out = self._tone_curve(linear_16, gain_map, gamma_map, white_map, bias_map)
         if input_was_unbatched:
@@ -190,14 +541,16 @@ class SemanticToneMapper(nn.Module):
     def export_lut(self, num_points=1024, device="cpu"):
         """
         Export per-class 1D LUT for fast ISP deployment.
+        Global adjustments are applied, local adjustments are ignored.
         Returns: numpy array [num_classes, num_points] in [0,1].
         """
         device = torch.device(device)
         gain, gamma, white, bias = self._params()
-        gain = gain.to(device)
-        gamma = gamma.to(device)
-        white = white.to(device)
-        bias = bias.to(device)
+        g_gain, g_gamma, g_white, g_bias = self._global_params()
+        gain = (gain * g_gain).to(device)
+        gamma = (gamma * g_gamma).to(device)
+        white = (white * g_white).to(device)
+        bias = (bias + g_bias).to(device)
 
         x = torch.linspace(0.0, 1.0, num_points, device=device)
         x = x.unsqueeze(0).repeat(self.num_classes, 1)
