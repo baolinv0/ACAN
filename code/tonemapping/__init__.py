@@ -10,6 +10,11 @@ from .scale_prediction_pipeline import load_scale_prediction_pipeline
 from .type_classifier import TypeClassifier
 from .type_classifier import load_type_classifier
 from .type_classifier import load_type_classifier_bundle
+from .iqa_fusion import FusionIQAModel
+from .iqa_fusion import IQAFeatureExtractor
+from .iqa_fusion import DynamicIQAAdapter
+from .iqa_fusion import CallableIQAAdapter
+from .iqa_fusion import train_fusion
 from .person_adjustment_predictor import HistogramProjector
 from .person_adjustment_predictor import PersonAdjustmentModel
 from .person_adjustment_predictor import PersonAdjustmentPredictor
@@ -25,6 +30,11 @@ __all__ = [
     "TypeClassifier",
     "load_type_classifier",
     "load_type_classifier_bundle",
+    "FusionIQAModel",
+    "IQAFeatureExtractor",
+    "DynamicIQAAdapter",
+    "CallableIQAAdapter",
+    "train_fusion",
     "HistogramProjector",
     "PersonAdjustmentModel",
     "PersonAdjustmentPredictor",
