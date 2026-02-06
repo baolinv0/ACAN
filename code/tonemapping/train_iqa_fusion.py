@@ -28,6 +28,11 @@ def build_parser():
     parser.add_argument("--hist-bins", type=int, default=16)
     parser.add_argument("--no-hist", action="store_true")
     parser.add_argument("--no-confidence", action="store_true")
+    parser.add_argument("--calibrate-mode", choices=["zscore", "minmax", "none"], default="zscore")
+    parser.add_argument("--reliability-alpha", type=float, default=4.0)
+    parser.add_argument("--reliability-min-weight", type=float, default=0.1)
+    parser.add_argument("--reliability-max-weight", type=float, default=2.0)
+    parser.add_argument("--weight-mode", choices=["multiply", "feature", "both", "none"], default="multiply")
     parser.add_argument("--device", default="cpu")
     return parser
 
@@ -48,6 +53,11 @@ def main():
         include_hist=not args.no_hist,
         hist_bins=args.hist_bins,
         include_confidence=not args.no_confidence,
+        calibrate_mode=args.calibrate_mode,
+        reliability_alpha=args.reliability_alpha,
+        min_weight=args.reliability_min_weight,
+        max_weight=args.reliability_max_weight,
+        weight_mode=args.weight_mode,
         hidden=args.hidden,
         batch_size=args.batch_size,
         epochs=args.epochs,

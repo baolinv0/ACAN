@@ -14,6 +14,11 @@ from .iqa_fusion import FusionIQAModel
 from .iqa_fusion import IQAFeatureExtractor
 from .iqa_fusion import DynamicIQAAdapter
 from .iqa_fusion import CallableIQAAdapter
+from .iqa_fusion import QInsightAdapter
+from .iqa_fusion import MDIQAAdapter
+from .iqa_fusion import FusionIQAPipeline
+from .iqa_fusion import load_fusion_pipeline
+from .iqa_fusion import load_fusion_pipeline_from_dir
 from .iqa_fusion import train_fusion
 from .person_adjustment_predictor import HistogramProjector
 from .person_adjustment_predictor import PersonAdjustmentModel
@@ -34,6 +39,11 @@ __all__ = [
     "IQAFeatureExtractor",
     "DynamicIQAAdapter",
     "CallableIQAAdapter",
+    "QInsightAdapter",
+    "MDIQAAdapter",
+    "FusionIQAPipeline",
+    "load_fusion_pipeline",
+    "load_fusion_pipeline_from_dir",
     "train_fusion",
     "HistogramProjector",
     "PersonAdjustmentModel",
